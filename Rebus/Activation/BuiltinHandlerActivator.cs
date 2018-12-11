@@ -4,8 +4,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Rebus.Bus;
-using Rebus.Extensions;
 using Rebus.Handlers;
+using Rebus.Logging;
 using Rebus.Pipeline;
 using Rebus.Transport;
 // ReSharper disable ForCanBeConvertedToForeach
@@ -19,6 +19,8 @@ namespace Rebus.Activation
     /// </summary>
     public class BuiltinHandlerActivator : IContainerAdapter, IDisposable
     {
+        private readonly ILog _log;
+
         readonly List<object> _handlerInstances = new List<object>();
         readonly List<Delegate> _handlerFactoriesNoArguments = new List<Delegate>();
         readonly List<Delegate> _handlerFactoriesMessageContextArgument = new List<Delegate>();
@@ -26,6 +28,13 @@ namespace Rebus.Activation
 
         readonly ConcurrentDictionary<Type, Func<IMessageContext, IHandleMessages>[]> _cachedHandlerFactories = new ConcurrentDictionary<Type, Func<IMessageContext, IHandleMessages>[]>();
         readonly ConcurrentDictionary<Type, IHandleMessages[]> _cachedHandlers = new ConcurrentDictionary<Type, IHandleMessages[]>();
+
+        public BuiltinHandlerActivator() : this(new NullLoggerFactory()) {  }
+
+        public BuiltinHandlerActivator(IRebusLoggerFactory loggerFactory)
+        {
+            _log = (loggerFactory ?? new NullLoggerFactory()).GetLogger<BuiltinHandlerActivator>();
+        }
 
         /// <summary>
         /// Returns all relevant handler instances for the given message by looking up compatible registered functions and instance factory methods.
@@ -59,8 +68,12 @@ namespace Rebus.Activation
             });
 
             // ReSharper disable once CoVariantArrayConversion
-            var instances = (IHandleMessages<TMessage>[])_cachedHandlers.GetOrAdd(typeof(TMessage), type => _handlerInstances
-                .OfType<IHandleMessages<TMessage>>().ToArray());
+            var instances = (IHandleMessages<TMessage>[])_cachedHandlers.GetOrAdd(typeof(TMessage), type =>
+            {
+                var handlers = _handlerInstances.OfType<IHandleMessages<TMessage>>().ToArray();
+                _log.Info("Creating new cached handlers for: {0}, total: {1}", typeof(TMessage).FullName, handlers.Length);
+                return handlers;
+            });
 
             var result = new IHandleMessages<TMessage>[handlerFactories.Length + instances.Length];
 
@@ -82,6 +95,10 @@ namespace Rebus.Activation
 
             Array.Copy(instances, 0, result, handlerFactories.Length, instances.Length);
 
+            if (result.Length == 0)
+            {
+                _log.Warn("No handler found for: {0}", typeof(TMessage).FullName);
+            }
             return result;
         }
 
@@ -99,11 +116,11 @@ namespace Rebus.Activation
             {
                 throw new ArgumentNullException(nameof(bus), "You need to provide a bus instance in order to call this method!");
             }
+
             if (Bus != null)
             {
                 throw new InvalidOperationException($"Cannot set bus to {bus} because it has already been set to {Bus}");
             }
-
             Bus = bus;
         }
 
@@ -113,6 +130,7 @@ namespace Rebus.Activation
         public BuiltinHandlerActivator Handle<TMessage>(Func<IBus, IMessageContext, TMessage, Task> handlerFunction)
         {
             _handlerInstances.Add(new Handler<TMessage>((bus, message) => handlerFunction(bus, MessageContext.Current, message), () => Bus));
+            ClearCache<TMessage>();
             return this;
         }
 
@@ -122,6 +140,7 @@ namespace Rebus.Activation
         public BuiltinHandlerActivator Handle<TMessage>(Func<IBus, TMessage, Task> handlerFunction)
         {
             _handlerInstances.Add(new Handler<TMessage>(handlerFunction, () => Bus));
+            ClearCache<TMessage>();
             return this;
         }
 
@@ -131,7 +150,14 @@ namespace Rebus.Activation
         public BuiltinHandlerActivator Handle<TMessage>(Func<TMessage, Task> handlerFunction)
         {
             _handlerInstances.Add(new Handler<TMessage>((bus, message) => handlerFunction(message), () => Bus));
+            ClearCache<TMessage>();
             return this;
+        }
+
+        private void ClearCache<TMessage>()
+        {
+            _cachedHandlers.TryRemove(typeof(TMessage), out _);
+            _log.Info("Registered handler for: {0}, cleared cache", typeof(TMessage).FullName);
         }
 
         class Handler<TMessage> : IHandleMessages<TMessage>
@@ -145,15 +171,12 @@ namespace Rebus.Activation
                 _getBus = getBus ?? throw new ArgumentNullException(nameof(getBus)); // store this function here because of Hen&Egg-Problem between handler activator and bus
             }
 
-            public async Task Handle(TMessage message)
-            {
-                await _handlerFunction(_getBus(), message);
-            }
+            public async Task Handle(TMessage message) => await _handlerFunction(_getBus(), message);
         }
 
         /// <summary>
         /// Registers the given factory method as a handler factory method for messages of the types determined by which
-        /// <see cref="IHandleMessages{TMessage}"/> interfaces are implemeted.
+        /// <see cref="IHandleMessages{TMessage}"/> interfaces are implemented.
         /// </summary>
         public BuiltinHandlerActivator Register<THandler>(Func<THandler> handlerFactory) where THandler : IHandleMessages
         {
@@ -199,4 +222,5 @@ namespace Rebus.Activation
             }
         }
     }
+
 }
